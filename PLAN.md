@@ -5,13 +5,13 @@ Evaluate tools for extracting movement features from video, test them on sample 
 
 ## Phases
 
-### Phase 1: Research Tools
-- [ ] Survey pose estimation tools (MediaPipe, OpenPose, MMPose, ViTPose, etc.)
-- [ ] Survey optical flow methods (Farneback, RAFT, FlowNet, etc.)
-- [ ] Survey motion energy / pixel-change approaches
-- [ ] Survey full-body tracking and action recognition tools (AlphaPose, DeepLabCut, etc.)
-- [ ] Document each tool: capabilities, input/output format, ease of use, GPU requirements, license
-- [ ] Write comparison summary in `research/tool_comparison.md`
+### Phase 1: Research Tools [COMPLETE]
+- [x] Survey pose estimation tools (MediaPipe, OpenPose, MMPose, ViTPose, RTMPose, YOLO11-Pose, etc.)
+- [x] Survey optical flow methods (DIS, Farneback, RAFT, GMFlow, UniMatch, etc.)
+- [x] Survey motion energy / pixel-change approaches
+- [x] Survey full-body tracking and action recognition tools (DeepLabCut, SLEAP, B-SOiD, SlowFast, MMAction2, etc.)
+- [x] Document each tool: capabilities, input/output format, ease of use, GPU requirements, license
+- [x] Write comparison summary in `research/tool_comparison.md`
 
 ### Phase 2: Set Up and Test Tools
 - [ ] Install top candidate tools
