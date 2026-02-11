@@ -1,0 +1,32 @@
+# Data files
+data/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Extracted features (large)
+*.parquet
+
+# Output visualizations (large)
+visualizations/*.mp4
+visualizations/*.avi
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
