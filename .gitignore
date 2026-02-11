@@ -5,8 +5,12 @@ data/
 *.mov
 *.mkv
 
-# Extracted features (large)
+# Extracted features and output CSVs (contain patient identifiers)
+output/
 *.parquet
+
+# Model weights (downloaded at runtime)
+models/
 
 # Output visualizations (large)
 visualizations/*.mp4
