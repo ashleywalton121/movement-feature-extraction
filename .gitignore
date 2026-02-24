@@ -5,6 +5,10 @@ data/
 *.mov
 *.mkv
 
+# Patient-identifying data (never commit)
+patient_first_names.csv
+precentral_m1_electrodes.csv
+
 # Extracted features and output CSVs (contain patient identifiers)
 output/
 *.parquet
