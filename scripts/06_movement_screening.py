@@ -16,6 +16,7 @@ Usage:
     python scripts/06_movement_screening.py --patients EM1279,EM1269,EM1201,EM1287 --tag-brightness
     python scripts/06_movement_screening.py --patients EM1279,EM1269,EM1201,EM1287 --scan-all
     python scripts/06_movement_screening.py --patients EM1279,EM1269,EM1201,EM1287 --scan-all --workers 8
+    python scripts/06_movement_screening.py --patients EM1279,EM1269,EM1201,EM1287 --build-copy-list
     python scripts/06_movement_screening.py --patients EM1279,EM1269,EM1201,EM1287 --thumbnails
 """
 
@@ -1275,6 +1276,625 @@ def _run_thumbnails(
 
 
 # ---------------------------------------------------------------------------
+# Copy list builder
+# ---------------------------------------------------------------------------
+DEFAULT_ACTIVE_THRESHOLD = 0.8
+DEFAULT_BUFFER_HR = 1.5
+DEFAULT_DENSE_NTH = 3
+DEFAULT_SPARSE_NTH = 15
+
+COPY_LIST_DIR = SCREENING_DIR / "copy_list"
+
+
+def _build_active_windows(
+    motion_df: pd.DataFrame, threshold: float, buffer_hr: float,
+) -> dict[tuple[str, str], list[tuple[float, float]]]:
+    """From sampled motion data, identify time windows with activity."""
+    windows = {}
+    for (pid, uuid), grp in motion_df.groupby(["patient_id", "uuid"]):
+        active = grp[grp["mean_motion"] >= threshold]
+        raw = [
+            (r["recording_offset_sec"] / 3600 - buffer_hr,
+             r["recording_offset_sec"] / 3600 + buffer_hr)
+            for _, r in active.iterrows()
+        ]
+        if raw:
+            raw.sort()
+            merged = [raw[0]]
+            for s, e in raw[1:]:
+                if s <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                else:
+                    merged.append((s, e))
+            windows[(pid, uuid)] = merged
+        else:
+            windows[(pid, uuid)] = []
+    return windows
+
+
+def _filter_copy_list(
+    scan_df: pd.DataFrame,
+    motion_df: pd.DataFrame,
+    threshold: float,
+    buffer_hr: float,
+    dense_nth: int,
+    sparse_nth: int,
+) -> pd.DataFrame:
+    """Build a filtered copy list from the brightness scan + motion data."""
+    color = scan_df[scan_df["is_grayscale"] == False].copy()
+    color["offset_hr"] = color["recording_offset_sec"] / 3600
+
+    # Only use color motion samples for window building
+    color_motion = motion_df.copy()
+    if "is_grayscale" in color_motion.columns:
+        color_motion = color_motion[color_motion["is_grayscale"] == False]
+    color_motion["offset_hr"] = color_motion["recording_offset_sec"] / 3600
+
+    active_windows = _build_active_windows(color_motion, threshold, buffer_hr)
+
+    def in_active(row):
+        ws = active_windows.get((row["patient_id"], row["uuid"]), [])
+        return any(s <= row["offset_hr"] <= e for s, e in ws)
+
+    color["in_active_window"] = color.apply(in_active, axis=1)
+
+    parts = []
+    for (pid, uuid), grp in color.groupby(["patient_id", "uuid"]):
+        grp = grp.sort_values("avi_index")
+        act = grp[grp["in_active_window"]]
+        quiet = grp[~grp["in_active_window"]]
+        if len(act) > 0:
+            parts.append(act.iloc[::dense_nth])
+        if len(quiet) > 0:
+            parts.append(quiet.iloc[::sparse_nth])
+
+    selected = pd.concat(parts).sort_values(
+        ["patient_id", "uuid", "avi_index"]
+    )
+    return selected, active_windows
+
+
+def _run_build_copy_list(
+    patient_ids: list[str],
+    config_path: Path,
+    metadata_path: Path,
+    data_root_override: str | None,
+    timeout: int,
+    workers: int,
+):
+    """Build filtered copy list, extract thumbnails, generate review HTML."""
+    from concurrent.futures import as_completed
+
+    config = load_config(config_path)
+    data_root = data_root_override or config.get("data_root", "")
+    meta = load_metadata(metadata_path)
+
+    # Load brightness scan
+    scan_csv = SCREENING_DIR / "brightness_scan.csv"
+    if not scan_csv.exists():
+        print("ERROR: brightness_scan.csv not found. Run --scan-all first.",
+              file=sys.stderr)
+        return
+    scan = pd.read_csv(scan_csv)
+    scan = scan[scan["patient_id"].isin(patient_ids)]
+
+    # Load motion screening
+    screening_csv = SCREENING_DIR / "screening_summary.csv"
+    if not screening_csv.exists():
+        print("ERROR: screening_summary.csv not found. Run screening first.",
+              file=sys.stderr)
+        return
+    screening = pd.read_csv(screening_csv)
+    screening = screening[
+        (screening["status"] == "ok")
+        & screening["patient_id"].isin(patient_ids)
+    ]
+
+    # Add grayscale info to screening
+    screening = screening.merge(
+        scan[["patient_id", "uuid", "avi_index", "is_grayscale"]],
+        on=["patient_id", "uuid", "avi_index"], how="left",
+    )
+
+    # Build filtered copy list
+    print("Building filtered copy list...")
+    print(f"  Active threshold: {DEFAULT_ACTIVE_THRESHOLD}")
+    print(f"  Buffer: +/- {DEFAULT_BUFFER_HR} hr")
+    print(f"  Dense sampling: every {DEFAULT_DENSE_NTH}rd in active windows")
+    print(f"  Sparse sampling: every {DEFAULT_SPARSE_NTH}th in quiet periods")
+
+    selected, active_windows = _filter_copy_list(
+        scan, screening,
+        DEFAULT_ACTIVE_THRESHOLD, DEFAULT_BUFFER_HR,
+        DEFAULT_DENSE_NTH, DEFAULT_SPARSE_NTH,
+    )
+
+    # Add file sizes and source paths
+    selected = selected.merge(
+        meta[["patient_id", "uuid", "avi_index", "file_size_bytes"]],
+        on=["patient_id", "uuid", "avi_index"], how="left",
+    )
+    selected["source_path"] = selected.apply(
+        lambda r: str(Path(data_root) / r["folder_name"] / r["avi_file"]),
+        axis=1,
+    )
+
+    # Print active windows
+    print(f"\nActive windows:")
+    for (pid, uuid), wins in sorted(active_windows.items()):
+        if wins:
+            w_str = ", ".join(f"{s:.1f}-{e:.1f}hr" for s, e in wins)
+        else:
+            w_str = "(quiet — sparse only)"
+        print(f"  {pid} {uuid[:10]}: {w_str}")
+
+    # Summary
+    total_gb = selected["file_size_bytes"].sum() / 1e9
+    n_act = selected["in_active_window"].sum()
+    print(f"\nCopy list: {len(selected)} AVIs, {total_gb:.1f} GB")
+    print(f"  Active: {n_act}  |  Quiet baseline: {len(selected) - n_act}")
+    for pid in sorted(selected["patient_id"].unique()):
+        pat = selected[selected["patient_id"] == pid]
+        gb = pat["file_size_bytes"].sum() / 1e9
+        act = pat["in_active_window"].sum()
+        print(f"  {pid}: {len(pat)} AVIs ({act} active, "
+              f"{len(pat)-act} quiet) {gb:.1f} GB")
+
+    # Save copy list CSV
+    COPY_LIST_DIR.mkdir(parents=True, exist_ok=True)
+    copy_csv = COPY_LIST_DIR / "copy_list.csv"
+    selected.to_csv(copy_csv, index=False)
+    print(f"\n  Saved: {copy_csv}")
+
+    # Extract thumbnails
+    thumbs_dir = COPY_LIST_DIR / "thumbs"
+    thumbs_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nExtracting thumbnails ({workers} workers)...")
+    t0 = time.time()
+    extracted = 0
+    skipped = 0
+    failed = 0
+
+    # Build work items
+    work = []
+    for _, row in selected.iterrows():
+        uuid_short = row["uuid"][:10]
+        thumb_name = f"{row['patient_id']}_{uuid_short}_{int(row['avi_index']):04d}.jpg"
+        thumb_path = thumbs_dir / thumb_name
+        if thumb_path.exists():
+            skipped += 1
+            continue
+        work.append({
+            "avi_path": Path(row["source_path"]),
+            "thumb_path": thumb_path,
+        })
+
+    if work:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_item = {
+                executor.submit(extract_thumbnail, item["avi_path"], item["thumb_path"]): item
+                for item in work
+            }
+            done = 0
+            for future in as_completed(future_to_item):
+                done += 1
+                try:
+                    success = future.result(timeout=timeout)
+                except Exception:
+                    success = False
+
+                if success:
+                    extracted += 1
+                else:
+                    failed += 1
+
+                if done % 50 == 0 or done == len(work):
+                    elapsed = time.time() - t0
+                    rate = done / elapsed if elapsed > 0 else 0
+                    print(f"  {done}/{len(work)} ({elapsed:.0f}s, "
+                          f"{rate:.1f}/s, {failed} failed)")
+
+    elapsed = time.time() - t0
+    print(f"\n  Thumbnails: {extracted} new, {skipped} existing, "
+          f"{failed} failed, {elapsed:.1f}s")
+
+    # Generate review HTML
+    print("\nGenerating review HTML...")
+    # Add activity_band for the HTML (approximate from screening data where available)
+    # For AVIs without direct motion data, label based on window membership
+    if "mean_motion" not in selected.columns:
+        selected["mean_motion"] = float("nan")
+
+    # Merge motion data where we have it
+    motion_cols = screening[["patient_id", "uuid", "avi_index", "mean_motion"]].copy()
+    selected = selected.merge(motion_cols, on=["patient_id", "uuid", "avi_index"],
+                              how="left", suffixes=("", "_screen"))
+    if "mean_motion_screen" in selected.columns:
+        selected["mean_motion"] = selected["mean_motion_screen"].combine_first(
+            selected["mean_motion"]
+        )
+        selected.drop(columns=["mean_motion_screen"], inplace=True)
+
+    # For AVIs without motion data, use window membership as proxy
+    no_motion = selected["mean_motion"].isna()
+    selected.loc[no_motion & selected["in_active_window"], "mean_motion"] = 1.0
+    selected.loc[no_motion & ~selected["in_active_window"], "mean_motion"] = 0.5
+
+    # Set status=ok for HTML generation
+    selected["status"] = "ok"
+
+    output_html = COPY_LIST_DIR / "copy_list_review.html"
+    generate_review_html(selected, thumbs_dir, output_html)
+    print(f"\nDone. Open copy_list_review.html in a browser to review before copying.")
+
+
+# ---------------------------------------------------------------------------
+# Matched contiguous-window review
+# ---------------------------------------------------------------------------
+MATCH_WINDOW_HR = 2.0
+MATCH_STEP_HR = 1.0
+MATCH_MIN_CLIPS = 3  # minimum clips per window to be considered
+
+
+def _compute_matched_windows(
+    df: pd.DataFrame,
+    n_sets: int = 10,
+    window_hr: float = MATCH_WINDOW_HR,
+    step_hr: float = MATCH_STEP_HR,
+    min_clips: int = MATCH_MIN_CLIPS,
+) -> list[dict]:
+    """Find top N matched contiguous time windows across patients.
+
+    For each patient+folder, builds sliding 2-hour windows and computes
+    mean brightness/saturation. Then finds cross-patient combinations that
+    minimize the max pairwise Euclidean distance in normalized space.
+
+    Returns list of dicts with: set_idx, max_dist, avg_bright, avg_sat, windows.
+    Each window contains: patient_id, uuid, uuid_short, start_hr, end_hr,
+    avi_min, avi_max, n_clips, mean_bright, mean_sat, clip_rows (list of row dicts).
+    """
+    from itertools import product
+
+    patients = sorted(df["patient_id"].unique())
+    if len(patients) < 2:
+        print("  Need at least 2 patients for matching.")
+        return []
+
+    # Ensure offset_hr
+    if "offset_hr" not in df.columns and "recording_offset_sec" in df.columns:
+        df = df.copy()
+        df["offset_hr"] = df["recording_offset_sec"] / 3600
+
+    # Build per-patient sliding windows
+    all_windows = []
+    for pid in patients:
+        pat = df[df["patient_id"] == pid]
+        for uuid, g in pat.groupby("uuid"):
+            g = g.sort_values("offset_hr")
+            max_hr = g["offset_hr"].max()
+            start = 0.0
+            while start + window_hr <= max_hr + 0.5:
+                w = g[(g["offset_hr"] >= start) & (g["offset_hr"] < start + window_hr)]
+                if len(w) >= min_clips:
+                    all_windows.append({
+                        "patient_id": pid,
+                        "uuid": uuid,
+                        "uuid_short": uuid[:10],
+                        "start_hr": start,
+                        "end_hr": start + window_hr,
+                        "n_clips": len(w),
+                        "mean_bright": w["mean_brightness"].mean(),
+                        "std_bright": w["mean_brightness"].std(),
+                        "mean_sat": w["mean_saturation"].mean(),
+                        "std_sat": w["mean_saturation"].std(),
+                        "avi_min": int(w["avi_index"].min()),
+                        "avi_max": int(w["avi_index"].max()),
+                        "clip_rows": w.to_dict("records"),
+                    })
+                start += step_hr
+
+    if not all_windows:
+        return []
+
+    wdf = pd.DataFrame([{k: v for k, v in w.items() if k != "clip_rows"}
+                         for w in all_windows])
+
+    # Normalize brightness and saturation to [0, 1]
+    bright_min = wdf["mean_bright"].min()
+    bright_range = max(wdf["mean_bright"].max() - bright_min, 1)
+    sat_min = wdf["mean_sat"].min()
+    sat_range = max(wdf["mean_sat"].max() - sat_min, 1)
+
+    for w in all_windows:
+        w["norm_b"] = (w["mean_bright"] - bright_min) / bright_range
+        w["norm_s"] = (w["mean_sat"] - sat_min) / sat_range
+
+    # Group by patient, keep top 15 by n_clips to limit combinations
+    per_patient = {}
+    for pid in patients:
+        pw = [w for w in all_windows if w["patient_id"] == pid]
+        if len(pw) > 15:
+            pw = sorted(pw, key=lambda x: -x["n_clips"])[:15]
+        per_patient[pid] = pw
+
+    # Find best combinations
+    best = []
+    for combo in product(*[per_patient[p] for p in patients]):
+        points = [(e["norm_b"], e["norm_s"]) for e in combo]
+        max_dist = 0
+        for a in range(len(points)):
+            for b in range(a + 1, len(points)):
+                d = ((points[a][0] - points[b][0])**2
+                     + (points[a][1] - points[b][1])**2) ** 0.5
+                max_dist = max(max_dist, d)
+
+        best.append({
+            "max_dist": max_dist,
+            "avg_bright": np.mean([e["mean_bright"] for e in combo]),
+            "avg_sat": np.mean([e["mean_sat"] for e in combo]),
+            "total_clips": sum(e["n_clips"] for e in combo),
+            "windows": list(combo),
+        })
+
+    best.sort(key=lambda x: x["max_dist"])
+
+    # De-duplicate: skip sets that reuse the same window for 3+ patients
+    seen = set()
+    result = []
+    for s in best:
+        # Key = tuple of (pid, uuid, start_hr) for each window
+        key = tuple(
+            (w["patient_id"], w["uuid"], w["start_hr"]) for w in s["windows"]
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(s)
+        if len(result) >= n_sets:
+            break
+
+    # Add set indices
+    for i, s in enumerate(result):
+        s["set_idx"] = i + 1
+
+    return result
+
+
+def generate_matched_review_html(
+    matched_sets: list[dict],
+    df: pd.DataFrame,
+    thumbs_dir: Path,
+    output_html: Path,
+):
+    """Generate self-contained HTML showing matched contiguous windows.
+
+    Each set shows one column per patient, with all clips in that patient's
+    2-hour window displayed as thumbnail strips.
+    """
+    # Build thumbnail lookup
+    thumb_lookup = {}
+    if thumbs_dir.exists():
+        for jpg in thumbs_dir.glob("*.jpg"):
+            thumb_lookup[jpg.stem] = _encode_image_base64(jpg)
+
+    patients = sorted(df["patient_id"].unique())
+    n_patients = len(patients)
+
+    # Build set sections
+    set_sections = []
+    for ms in matched_sets:
+        # One column per patient window
+        columns_html = []
+        for win in ms["windows"]:
+            pid = win["patient_id"]
+            uuid_short = win["uuid_short"]
+
+            # Build thumbnail strip for all clips in this window
+            clip_cards = []
+            clips = sorted(win["clip_rows"], key=lambda r: r.get("avi_index", 0))
+            for clip in clips:
+                avi_idx = int(clip.get("avi_index", 0))
+                thumb_key = "%s_%s_%04d" % (pid, uuid_short, avi_idx)
+                b64 = thumb_lookup.get(thumb_key, "")
+
+                if b64:
+                    img_tag = ('<img src="%s" style="width:100%%;'
+                               'border-radius:3px;">' % b64)
+                else:
+                    img_tag = ('<div style="width:100%%;height:60px;background:#f0f0f0;'
+                               'display:flex;align-items:center;justify-content:center;'
+                               'color:#bbb;border-radius:3px;font-size:9px;">—</div>')
+
+                c_bright = clip.get("mean_brightness", 0)
+                c_sat = clip.get("mean_saturation", 0)
+                c_hr = clip.get("offset_hr",
+                                clip.get("recording_offset_sec", 0) / 3600)
+
+                clip_cards.append(
+                    '<div style="margin-bottom:4px;">'
+                    '%s'
+                    '<div style="font-size:9px;color:#888;margin-top:2px;">'
+                    'AVI %04d &middot; %.1fh &middot; b=%d s=%d'
+                    '</div>'
+                    '</div>' % (img_tag, avi_idx, c_hr, c_bright, c_sat)
+                )
+
+            b_color = BRIGHTNESS_COLORS.get(
+                win.get("brightness_bin", "normal"), "#66bb6a")
+
+            columns_html.append(
+                '<div style="flex:1;min-width:220px;max-width:320px;">'
+                '<div style="background:#1565c0;color:#fff;padding:6px 10px;'
+                'border-radius:6px 6px 0 0;font-weight:700;font-size:14px;">'
+                '%s'
+                '</div>'
+                '<div style="background:#fff;border:1px solid #ddd;'
+                'border-top:none;border-radius:0 0 6px 6px;padding:8px;">'
+                '<div style="font-family:monospace;font-size:10px;color:#666;'
+                'margin-bottom:6px;">'
+                '%s... &middot; AVI %04d&ndash;%04d<br>'
+                '%.0f&ndash;%.0fh &middot; %d clips<br>'
+                'bright=%.0f&plusmn;%.0f &middot; sat=%.0f&plusmn;%.0f'
+                '</div>'
+                '<div style="max-height:600px;overflow-y:auto;">'
+                '%s'
+                '</div>'
+                '</div>'
+                '</div>' % (
+                    pid,
+                    uuid_short, win["avi_min"], win["avi_max"],
+                    win["start_hr"], win["end_hr"], win["n_clips"],
+                    win["mean_bright"], win.get("std_bright", 0),
+                    win["mean_sat"], win.get("std_sat", 0),
+                    "".join(clip_cards),
+                )
+            )
+
+        set_sections.append(
+            '<div style="margin-bottom:32px;padding:16px;background:#fafafa;'
+            'border:1px solid #e0e0e0;border-radius:10px;">'
+            '<div style="margin-bottom:12px;">'
+            '<span style="font-weight:700;font-size:18px;color:#333;">'
+            'Set %d'
+            '</span>'
+            '<span style="margin-left:14px;font-size:12px;color:#888;">'
+            'match distance: %.4f &middot; '
+            'avg brightness: %.0f &middot; '
+            'avg saturation: %.0f &middot; '
+            'total clips: %d'
+            '</span>'
+            '</div>'
+            '<div style="display:flex;gap:14px;flex-wrap:wrap;'
+            'align-items:flex-start;">'
+            '%s'
+            '</div>'
+            '</div>' % (
+                ms["set_idx"], ms["max_dist"],
+                ms["avg_bright"], ms["avg_sat"], ms["total_clips"],
+                "".join(columns_html),
+            )
+        )
+
+    # Per-patient summary table
+    patient_summary_rows = []
+    for pid in patients:
+        pat = df[df["patient_id"] == pid]
+        n_uuids = pat["uuid"].nunique()
+        total_clips = len(pat)
+        gb = pat.get("file_size_bytes", pd.Series([0])).sum() / 1e9
+        patient_summary_rows.append(
+            '<tr><td style="font-weight:600;">%s</td>'
+            '<td>%d</td><td>%d</td>'
+            '<td>%.1f GB</td></tr>' % (pid, n_uuids, total_clips, gb)
+        )
+
+    # Detect window size from the matched sets
+    if matched_sets and matched_sets[0]["windows"]:
+        win0 = matched_sets[0]["windows"][0]
+        win_size = win0["end_hr"] - win0["start_hr"]
+    else:
+        win_size = 2
+
+    win_str = "%g" % win_size
+
+    html = (
+        '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="utf-8">\n'
+        '<title>Cross-Patient Matched Windows Review</title>\n'
+        '<style>\n'
+        '  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;\n'
+        '         max-width: 1600px; margin: 0 auto; padding: 20px; background: #fff; }\n'
+        '  h1 { color: #1565c0; margin-bottom: 4px; }\n'
+        '  .subtitle { color: #666; margin-bottom: 20px; font-size: 14px; }\n'
+        '  table { border-collapse: collapse; margin-bottom: 20px; }\n'
+        '  th, td { padding: 6px 14px; text-align: left; border: 1px solid #ddd; }\n'
+        '  th { background: #f5f5f5; font-size: 13px; }\n'
+        '  td { font-size: 13px; }\n'
+        '  .instructions { background: #e3f2fd; border-radius: 8px; padding: 14px;\n'
+        '                   margin-bottom: 24px; font-size: 13px; line-height: 1.6; }\n'
+        '</style>\n</head>\n<body>\n'
+        '<h1>Cross-Patient Matched Contiguous Windows</h1>\n'
+        '<div class="subtitle">\n'
+        '  ' + str(len(matched_sets)) + ' matched sets across '
+        + str(n_patients) + ' patients &middot;\n'
+        '  Each set is a ' + win_str + '-hour contiguous window per patient, '
+        'matched by brightness + saturation\n'
+        '</div>\n\n'
+        '<div class="instructions">\n'
+        '  <b>How to use:</b> Each set shows a ' + win_str + '-hour contiguous '
+        'window of AVIs per patient,\n'
+        '  matched by similar brightness and color saturation. All clips within '
+        'each window\n'
+        '  are shown as a thumbnail strip so you can verify visual consistency. '
+        'Sets are\n'
+        '  ordered by match quality (Set 1 = closest match across patients). '
+        'Scroll within\n'
+        '  each column to see all clips.\n'
+        '</div>\n\n'
+        '<h3>Patient Summary (filtered dataset)</h3>\n'
+        '<table>\n'
+        '  <tr><th>Patient</th><th>Folders</th><th>Clips</th><th>Size</th></tr>\n'
+        '  ' + "".join(patient_summary_rows) + '\n'
+        '</table>\n\n'
+        '<h3>Matched Windows</h3>\n'
+        + "".join(set_sections) + '\n\n'
+        '<div style="margin-top:30px;padding-top:16px;border-top:1px solid #eee;\n'
+        '            color:#999;font-size:11px;">\n'
+        '  Generated by 06_movement_screening.py --matched-review\n'
+        '</div>\n</body>\n</html>'
+    )
+
+    output_html.write_text(html, encoding="utf-8")
+    size_mb = output_html.stat().st_size / (1024 * 1024)
+    print("  Wrote %s (%.1f MB)" % (output_html, size_mb))
+
+
+def _run_matched_review(patient_ids: list[str], window_hr: float = MATCH_WINDOW_HR):
+    """Load filtered copy list, compute matched contiguous windows, generate HTML."""
+    filtered_csv = COPY_LIST_DIR / "copy_list_filtered.csv"
+    if not filtered_csv.exists():
+        print("ERROR: %s not found." % filtered_csv, file=sys.stderr)
+        print("  Run --build-copy-list first, then apply exclusions.",
+              file=sys.stderr)
+        return
+
+    df = pd.read_csv(filtered_csv)
+    df = df[df["patient_id"].isin(patient_ids)]
+    print("Loaded %d clips from %s" % (len(df), filtered_csv))
+    print("  Patients: %s" % sorted(df["patient_id"].unique()))
+
+    # Ensure offset_hr
+    if "offset_hr" not in df.columns and "recording_offset_sec" in df.columns:
+        df["offset_hr"] = df["recording_offset_sec"] / 3600
+
+    # Compute matched windows
+    print("\nComputing matched contiguous %d-hour windows..." % window_hr)
+    matched_sets = _compute_matched_windows(df, n_sets=10, window_hr=window_hr)
+    if not matched_sets:
+        print("  No matched sets found.")
+        return
+
+    for ms in matched_sets:
+        wins_str = "  |  ".join(
+            "%s %s AVI %04d-%04d %.0f-%.0fh n=%d b=%.0f s=%.0f" % (
+                w["patient_id"], w["uuid_short"],
+                w["avi_min"], w["avi_max"],
+                w["start_hr"], w["end_hr"], w["n_clips"],
+                w["mean_bright"], w["mean_sat"],
+            )
+            for w in ms["windows"]
+        )
+        print("  Set %d: dist=%.3f  %s" % (ms["set_idx"], ms["max_dist"], wins_str))
+
+    # Generate HTML
+    thumbs_dir = COPY_LIST_DIR / "thumbs"
+    output_html = COPY_LIST_DIR / "matched_sets_review.html"
+    print("\nGenerating matched-windows review HTML...")
+    generate_matched_review_html(matched_sets, df, thumbs_dir, output_html)
+    print("\nDone. Open matched_sets_review.html in a browser to review.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1327,11 +1947,36 @@ def main():
     )
     parser.add_argument(
         "--workers", type=int, default=4,
-        help="Number of parallel workers for --scan-all (default 4)"
+        help="Number of parallel workers for --scan-all / --build-copy-list (default 4)"
+    )
+    parser.add_argument(
+        "--build-copy-list", action="store_true",
+        help="Build filtered copy list with thumbnails and review HTML"
+    )
+    parser.add_argument(
+        "--matched-review", action="store_true",
+        help="Generate matched-pairs review HTML from copy_list_filtered.csv"
+    )
+    parser.add_argument(
+        "--window-hours", type=float, default=MATCH_WINDOW_HR,
+        help="Window size in hours for --matched-review (default: %.0f)" % MATCH_WINDOW_HR
     )
     args = parser.parse_args()
 
     patient_ids = [p.strip() for p in args.patients.split(",")]
+
+    # --build-copy-list mode: filter + thumbnails + review HTML
+    # --matched-review mode: generate matched-pairs HTML from filtered CSV
+    if args.matched_review:
+        _run_matched_review(patient_ids, window_hr=args.window_hours)
+        return
+
+    if args.build_copy_list:
+        _run_build_copy_list(
+            patient_ids, args.config, args.metadata,
+            args.data_root, args.timeout, args.workers,
+        )
+        return
 
     # --scan-all mode: scan ALL AVIs for brightness/grayscale
     if args.scan_all:

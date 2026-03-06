@@ -78,8 +78,8 @@ def process_video(video_path, mhi_duration_sec=2.0, diff_threshold=25,
 
         # Update MHI: set moving pixels to current timestamp, decay old ones
         timestamp = np.float64(frame_idx)
-        mhi_duration_f = np.float64(mhi_duration)
-        cv2.motempl.updateMotionHistory(motion_mask, mhi, timestamp, mhi_duration_f)
+        mhi[motion_mask > 0] = timestamp
+        mhi[(mhi > 0) & (mhi < timestamp - mhi_duration)] = 0
 
         # Compute MEI: any pixel that moved within the MHI window
         mei = (mhi > (timestamp - mhi_duration)).astype(np.uint8)

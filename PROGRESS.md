@@ -1,5 +1,35 @@
 # Movement Feature Extraction — Progress Log
 
+## 2026-02-24 — Phase 0: Build Config (Patient → DbData Folder Mapping)
+
+### Completed
+- Created `scripts/00_build_config.py` — maps 28 patient EM IDs to their N:\DbData folders
+- Two-pass workflow for ambiguous last-name matches:
+  1. `--no-scan` run identifies 19 confirmed + 9 ambiguous patients (~1.4s)
+  2. Created `patient_first_names.csv` with correct first names for the 9 ambiguous cases
+  3. Full scan with `--first-name-filter` resolves all 28 patients
+- Full scan completed: 1,218 folders scanned across 28 patients (~8 min over network)
+- Outputs generated:
+  - `output/match_report.csv` — summary of matches per patient
+  - `output/config.yaml` — full inventory for downstream scripts
+
+### Key Stats
+| Stat | Value |
+|---|---|
+| Patients matched | 28/28 |
+| Total folders scanned | 1,218 |
+| Folders with video | 642 |
+| Total AVI files | ~395,000 |
+| Largest dataset | Klett (37,883 AVIs, 62 folders w/video) |
+| Smallest dataset | Azzi (4,126 AVIs, 8 folders w/video) |
+
+### Next Steps
+- [ ] Review config.yaml for completeness — spot-check a few patients
+- [ ] Build Phase 1 scripts that consume config.yaml (video selection, feature extraction)
+- [ ] Determine which study folders per patient contain the relevant EMU stay (vs. outpatient visits)
+
+---
+
 ## 2026-02-11 — Phase 2 Continued: Additional Methods + Visualizations
 
 ### Completed
